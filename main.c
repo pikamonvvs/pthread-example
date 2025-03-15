@@ -11,14 +11,12 @@
 #define MAX_QUEUE 100
 #define MAX_CMD 128
 
-// Command structure
 typedef struct
 {
     unsigned char cmd[MAX_CMD];
     unsigned int len;
 } DATA_T;
 
-// Circular buffer structure
 typedef struct
 {
     DATA_T data[MAX_QUEUE];
@@ -27,19 +25,15 @@ typedef struct
     int count;
 } BUFFER_T;
 
-// Shared data structure
 typedef struct
 {
     BUFFER_T buffer;
-    volatile int eventOccurred;
     pthread_cond_t cond;
     pthread_mutex_t mutex;
 } SHARED_DATA_T;
 
-// 전역 변수로 선언
 static SHARED_DATA_T _vptcTxQueue;
 
-// Queue operations
 void queueInit(void)
 {
     _vptcTxQueue.buffer.head = 0;
@@ -53,6 +47,7 @@ int vptc_comm_write(unsigned char *cmdData, unsigned int len)
 
     if (cmdData == NULL || len > MAX_CMD)
     {
+        printMessage("Write Error: Invalid input parameters (cmdData=%p, len=%u)", cmdData, len);
         return -1;
     }
 
@@ -60,6 +55,7 @@ int vptc_comm_write(unsigned char *cmdData, unsigned int len)
 
     if (_vptcTxQueue.buffer.count >= MAX_QUEUE)
     {
+        printMessage("Write Error: Queue is full (count=%d)", _vptcTxQueue.buffer.count);
         goto exit;
     }
 
@@ -67,9 +63,9 @@ int vptc_comm_write(unsigned char *cmdData, unsigned int len)
     _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.tail].len = len;
     _vptcTxQueue.buffer.tail = (_vptcTxQueue.buffer.tail + 1) % MAX_QUEUE;
     _vptcTxQueue.buffer.count++;
-    _vptcTxQueue.eventOccurred = 1;
     if (pthread_cond_signal(&_vptcTxQueue.cond) != 0)
     {
+        printMessage("Write Error: Failed to signal condition variable");
         ret = -1;
         goto exit;
     }
@@ -77,6 +73,9 @@ int vptc_comm_write(unsigned char *cmdData, unsigned int len)
 
 exit:
     pthread_mutex_unlock(&_vptcTxQueue.mutex);
+
+    usleep(1000);
+
     return ret;
 }
 
@@ -89,6 +88,7 @@ int s_tlcp_comm_vptc_read(unsigned char *cmdData)
 
     if (_vptcTxQueue.buffer.count <= 0)
     {
+        printMessage("Read Error: Queue is empty");
         goto exit;
     }
 
@@ -96,7 +96,7 @@ int s_tlcp_comm_vptc_read(unsigned char *cmdData)
     memcpy(cmdData, _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.head].cmd, readLen);
     _vptcTxQueue.buffer.head = (_vptcTxQueue.buffer.head + 1) % MAX_QUEUE;
     _vptcTxQueue.buffer.count--;
-    _vptcTxQueue.eventOccurred = 0;
+
     ret = readLen;
 
 exit:
@@ -104,16 +104,15 @@ exit:
     return ret;
 }
 
-int s_tlcp_comm_vptc_poll(int timeout_ms)
+int s_tlcp_comm_vptc_poll(int timeout)
 {
     int ret = -1;
 
     pthread_mutex_lock(&_vptcTxQueue.mutex);
 
-    // timeout이 -1이면 무한 대기
-    if (timeout_ms < 0)
+    if (timeout < 0)
     {
-        while (!_vptcTxQueue.eventOccurred)
+        while (_vptcTxQueue.buffer.count == 0)
         {
             pthread_cond_wait(&_vptcTxQueue.cond, &_vptcTxQueue.mutex);
         }
@@ -123,8 +122,8 @@ int s_tlcp_comm_vptc_poll(int timeout_ms)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
 
-        ts.tv_sec += timeout_ms / 1000;
-        ts.tv_nsec += (timeout_ms % 1000) * 1000000;
+        ts.tv_sec += timeout / 1000;
+        ts.tv_nsec += (timeout % 1000) * 1000000;
 
         if (ts.tv_nsec >= 1000000000)
         {
@@ -132,11 +131,12 @@ int s_tlcp_comm_vptc_poll(int timeout_ms)
             ts.tv_nsec -= 1000000000;
         }
 
-        while (!_vptcTxQueue.eventOccurred)
+        while (_vptcTxQueue.buffer.count == 0)
         {
             ret = pthread_cond_timedwait(&_vptcTxQueue.cond, &_vptcTxQueue.mutex, &ts);
             if (ret == ETIMEDOUT)
             {
+                printMessage("Poll Error: Timeout occurred after %d ms", timeout);
                 goto exit;
             }
         }
@@ -157,12 +157,16 @@ void *vptcSideCommTask(void *arg)
 
     srand(time(NULL));
     totalSends = rand() % 11 + 5;
+    totalSends = 1000; // for overrun test
 
-    printMessage("TX task", "Start", NULL, 0);
-    printf("TX task will send %d commands\n", totalSends);
+    printMessage("TX task: Start");
+    printMessage("TX task will send %d commands", totalSends);
 
     for (int i = 0; i < totalSends; i++)
     {
+        char hexStr[MAX_CMD * 3 + 1] = {0};
+        printMessage("TX task: Try #%d", i + 1);
+
         unsigned int cmdLen = (rand() % 13 + 4);
 
         for (unsigned int j = 0; j < cmdLen; j++)
@@ -174,17 +178,19 @@ void *vptcSideCommTask(void *arg)
 
         if (writtenBytes > 0)
         {
-            printMessage("TX task", "Sent command", cmd, writtenBytes);
+            for (unsigned int i = 0; i < writtenBytes; i++)
+            {
+                sprintf(hexStr + i * 3, "%02X ", cmd[i]);
+            }
+            printMessage("TX task: Sent command (len=%d): %s", writtenBytes, hexStr);
         }
         else
         {
-            printMessage("TX task", "Queue is full", NULL, 0);
+            printMessage("TX task: Queue is full");
         }
-
-        sleep(1);
     }
 
-    printMessage("TX task", "Completed all sends", NULL, 0);
+    printMessage("TX task: Completed all sends");
     return NULL;
 }
 
@@ -193,20 +199,25 @@ void *tlcpSideCommTask(void *arg)
     unsigned char cmd[MAX_CMD];
     int cmdLen;
 
-    printMessage("RX task", "Start", NULL, 0);
+    printMessage("RX task: Start");
 
     while (1)
     {
         if (s_tlcp_comm_vptc_poll(-1) < 0)
         {
-            printMessage("RX task", "Timeout occurred", NULL, 0);
+            printMessage("RX task: Timeout occurred");
             continue;
         }
 
         cmdLen = s_tlcp_comm_vptc_read(cmd);
         if (cmdLen > 0)
         {
-            printMessage("RX task", "Received command", cmd, cmdLen);
+            char hexStr[MAX_CMD * 3 + 1] = {0};
+            for (unsigned int i = 0; i < cmdLen; i++)
+            {
+                sprintf(hexStr + i * 3, "%02X ", cmd[i]);
+            }
+            printMessage("RX task: Received command (len=%d): %s", cmdLen, hexStr);
         }
     }
     return NULL;
@@ -230,7 +241,6 @@ int main()
         return -1;
     }
 
-    _vptcTxQueue.eventOccurred = 0;
     queueInit();
 
     if ((ret = pthread_create(&vptcThread, NULL, vptcSideCommTask, NULL)) != 0)

@@ -3,8 +3,12 @@
 #include <stdio.h>
 #include <sys/time.h>
 #include <time.h>
+#include <stdarg.h>
+#include <pthread.h>
 
 #define MAX_CMD 128
+
+static pthread_mutex_t printMutex = PTHREAD_MUTEX_INITIALIZER;
 
 void getCurrentTime(char *buffer)
 {
@@ -23,23 +27,21 @@ void getCurrentTime(char *buffer)
             tv.tv_usec);
 }
 
-void printMessage(const char *taskName, const char *messageType, const unsigned char *data, unsigned int len)
+void printMessage(const char *format, ...)
 {
+    pthread_mutex_lock(&printMutex);
+    
     char timeStr[20];
     getCurrentTime(timeStr);
+    printf("[%s] ", timeStr);
 
-    if (data != NULL)
-    {
-        char hexStr[MAX_CMD * 3 + 1] = {0};
-        for (unsigned int i = 0; i < len; i++)
-        {
-            sprintf(hexStr + i * 3, "%02X ", data[i]);
-        }
-        printf("[%s] %s: %s (len=%u): %s\n", timeStr, taskName, messageType, len, hexStr);
-    }
-    else
-    {
-        printf("[%s] %s: %s\n", timeStr, taskName, messageType);
-    }
+    va_list args;
+    va_start(args, format);
+    vprintf(format, args);
+    va_end(args);
+
+    printf("\n");
     fflush(stdout);
+    
+    pthread_mutex_unlock(&printMutex);
 }
