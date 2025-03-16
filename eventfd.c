@@ -51,153 +51,89 @@ void queueInit(void)
 int vptc_comm_write(unsigned char *cmdData, unsigned int len)
 {
     int ret = -1;
+    struct timespec req = {0, 1};
     uint64_t value = 1;
 
     if (cmdData == NULL || len > MAX_CMD)
-    {
-        printMessage("Write Error: Invalid input parameters (cmdData=%p, len=%u)", cmdData, len);
         return -1;
-    }
 
     pthread_mutex_lock(&_vptcTxQueue.mutex);
 
-    if (_vptcTxQueue.buffer.count >= MAX_QUEUE)
+    if (_vptcTxQueue.buffer.count < MAX_QUEUE)
     {
-        printMessage("Write Error: Queue is full (count=%d)", _vptcTxQueue.buffer.count);
-        goto exit;
+        memcpy(_vptcTxQueue.buffer.data[_vptcTxQueue.buffer.tail].cmd, cmdData, len);
+        _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.tail].len = len;
+        _vptcTxQueue.buffer.tail = (_vptcTxQueue.buffer.tail + 1) % MAX_QUEUE;
+        _vptcTxQueue.buffer.count++;
+
+        write(_vptcTxQueue.event_fd, &value, sizeof(value));
+        ret = len;
     }
 
-    memcpy(_vptcTxQueue.buffer.data[_vptcTxQueue.buffer.tail].cmd, cmdData, len);
-    _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.tail].len = len;
-    _vptcTxQueue.buffer.tail = (_vptcTxQueue.buffer.tail + 1) % MAX_QUEUE;
-    _vptcTxQueue.buffer.count++;
-
-    if (write(_vptcTxQueue.event_fd, &value, sizeof(value)) < 0)
-    {
-        printMessage("Write Error: Failed to signal event");
-        ret = -1;
-        goto exit;
-    }
-    ret = len;
-
-exit:
     pthread_mutex_unlock(&_vptcTxQueue.mutex);
 
-    usleep(1000);
-
+    nanosleep(&req, NULL);
     return ret;
 }
 
 int s_tlcp_comm_vptc_read(unsigned char *cmdData)
 {
     int ret = -1;
-    unsigned int readLen = 0;
+    uint64_t value;
 
     pthread_mutex_lock(&_vptcTxQueue.mutex);
 
-    if (_vptcTxQueue.buffer.count <= 0)
+    if (_vptcTxQueue.buffer.count > 0)
     {
-        printMessage("Read Error: Queue is empty");
-        goto exit;
+        ret = _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.head].len;
+        memcpy(cmdData, _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.head].cmd, ret);
+        _vptcTxQueue.buffer.head = (_vptcTxQueue.buffer.head + 1) % MAX_QUEUE;
+        _vptcTxQueue.buffer.count--;
     }
 
-    readLen = _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.head].len;
-    memcpy(cmdData, _vptcTxQueue.buffer.data[_vptcTxQueue.buffer.head].cmd, readLen);
-    _vptcTxQueue.buffer.head = (_vptcTxQueue.buffer.head + 1) % MAX_QUEUE;
-    _vptcTxQueue.buffer.count--;
-
-    ret = readLen;
-
-exit:
     pthread_mutex_unlock(&_vptcTxQueue.mutex);
     return ret;
 }
 
 int s_tlcp_comm_vptc_poll(int timeout)
 {
-    int ret = -1;
-    uint64_t value;
     struct pollfd pfd;
-
-    pthread_mutex_lock(&_vptcTxQueue.mutex);
-
-    if (_vptcTxQueue.buffer.count > 0)
-    {
-        ret = 0;
-        goto exit;
-    }
-
-    pthread_mutex_unlock(&_vptcTxQueue.mutex);
-
     pfd.fd = _vptcTxQueue.event_fd;
     pfd.events = POLLIN;
-
-    ret = poll(&pfd, 1, timeout);
-    if (ret > 0)
-    {
-        if (read(_vptcTxQueue.event_fd, &value, sizeof(value)) < 0)
-        {
-            printMessage("Poll Error: Failed to read event");
-            return -1;
-        }
-        ret = 0;
-    }
-    else if (ret == 0)
-    {
-        printMessage("Poll Error: Timeout occurred after %d ms", timeout);
-        return -1;
-    }
-
-    pthread_mutex_lock(&_vptcTxQueue.mutex);
-    return ret;
-
-exit:
-    pthread_mutex_unlock(&_vptcTxQueue.mutex);
-    return ret;
+    return poll(&pfd, 1, timeout);
 }
 
 void *vptcSideCommTask(void *arg)
 {
     unsigned char cmd[MAX_CMD];
     int writtenBytes;
-    int totalSends;
-
-    srand(time(NULL));
-    totalSends = rand() % 11 + 5;
-    totalSends = 1000; // for overrun test
+    int totalSends = 1000;
+    int successCount = 0;
+    int failCount = 0;
 
     printMessage("TX task: Start");
-    printMessage("TX task will send %d commands", totalSends);
 
     for (int i = 0; i < totalSends; i++)
     {
-        char hexStr[MAX_CMD * 3 + 1] = {0};
-        printMessage("TX task: Try #%d", i + 1);
-
-        unsigned int cmdLen = (rand() % 13 + 4);
-
-        for (unsigned int j = 0; j < cmdLen; j++)
+        unsigned int cmdLen = 8;
+        cmd[0] = (unsigned char)(i & 0xFF);
+        for (unsigned int j = 1; j < cmdLen; j++)
         {
-            cmd[j] = rand() % 256;
+            cmd[j] = (unsigned char)j;
         }
 
         writtenBytes = vptc_comm_write(cmd, cmdLen);
-
-        if (writtenBytes > 0)
+        if (writtenBytes <= 0)
         {
-            for (unsigned int i = 0; i < writtenBytes; i++)
-            {
-                sprintf(hexStr + i * 3, "%02X ", cmd[i]);
-            }
-            printMessage("TX task: Sent command (len=%d): %s", writtenBytes, hexStr);
+            failCount++;
         }
         else
         {
-            printMessage("TX task: Queue is full");
+            successCount++;
         }
     }
 
-    printMessage("TX task: Completed all sends");
+    printMessage("TX task: Completed - Success: %d, Failed: %d", successCount, failCount);
     return NULL;
 }
 
@@ -205,6 +141,9 @@ void *tlcpSideCommTask(void *arg)
 {
     unsigned char cmd[MAX_CMD];
     int cmdLen;
+    int receivedCount = 0;
+    int lastSeq = -1;
+    int outOfOrderCount = 0;
 
     printMessage("RX task: Start");
 
@@ -212,19 +151,27 @@ void *tlcpSideCommTask(void *arg)
     {
         if (s_tlcp_comm_vptc_poll(-1) < 0)
         {
-            printMessage("RX task: Timeout occurred");
             continue;
         }
 
         cmdLen = s_tlcp_comm_vptc_read(cmd);
-        if (cmdLen > 0)
+        if (cmdLen <= 0)
         {
-            char hexStr[MAX_CMD * 3 + 1] = {0};
-            for (unsigned int i = 0; i < cmdLen; i++)
-            {
-                sprintf(hexStr + i * 3, "%02X ", cmd[i]);
-            }
-            printMessage("RX task: Received command (len=%d): %s", cmdLen, hexStr);
+            continue;
+        }
+
+        receivedCount++;
+        if (lastSeq >= 0 && (cmd[0] != ((lastSeq + 1) & 0xFF)))
+        {
+            outOfOrderCount++;
+        }
+        lastSeq = cmd[0];
+
+        // 매 100개 패킷마다 통계 출력
+        if (receivedCount % 100 == 0)
+        {
+            printMessage("RX task: Received %d packets, Out of order: %d",
+                         receivedCount, outOfOrderCount);
         }
     }
     return NULL;
